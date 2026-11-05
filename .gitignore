@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+bridge/node_modules/
+__pycache__/
+*.png
+!app/MacUse.png
+dist/

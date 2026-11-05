@@ -1,0 +1,83 @@
+name: Build MacUse
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macuse-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check toolchain
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          swift --version
+          node --version
+
+      - name: Swift build and protocol tests
+        run: |
+          set -euo pipefail
+          swift build
+          node tests/protocol.mjs
+
+      - name: MCP bridge tests
+        working-directory: bridge
+        run: |
+          set -euo pipefail
+          npm ci
+          node ../tests/mcp.mjs
+
+      - name: Build and verify App
+        run: |
+          set -euo pipefail
+          bash scripts/build-app.sh
+          APP='dist/MacUse Helper.app'
+          test "$(lipo -archs "$APP/Contents/MacOS/MacUse")" = arm64
+          plutil -lint "$APP/Contents/Info.plist"
+          test -s "$APP/Contents/Resources/MacUse.icns"
+          codesign --verify --strict "$APP"
+
+      - name: Compile Swift native E2E
+        run: swiftc -parse-as-library tests/NativeE2E.swift -o .build/native-e2e
+
+      - name: Package App
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent \
+            'dist/MacUse Helper.app' artifacts/MacUse-macos-arm64.zip
+          (cd artifacts && shasum -a 256 MacUse-macos-arm64.zip > SHA256SUMS.txt)
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: MacUse-macos-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
