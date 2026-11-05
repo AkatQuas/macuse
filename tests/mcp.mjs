@@ -45,7 +45,7 @@ async function connect(){
 try{
  await connect();
  const {tools}=await client.listTools();
- assert.deepEqual(tools.map(t=>t.name).sort(),['check_permissions','list_apps','get_app_state','get_screenshot','click','set_value','type_text','press_key','end_session'].sort());
+ assert.deepEqual(tools.map(t=>t.name).sort(),['check_permissions','list_apps','list_displays','get_app_state','get_screenshot','get_display_screenshot','click','set_value','type_text','press_key','end_session'].sort());
  assert.deepEqual(tools.find(t=>t.name==='get_screenshot').inputSchema.required,['app','snapshot_id']);
  console.log('PASS MCP initialization and tool schemas');
  const permissions=await client.callTool({name:'check_permissions',arguments:{}});

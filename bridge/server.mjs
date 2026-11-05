@@ -14,9 +14,11 @@ const target={app:{...text,description:'Allowed application bundle identifier.'}
 const definitions=[
  ['check_permissions','Read Accessibility and screen recording permission status.',{},[],true],
  ['list_apps','List running GUI apps and whether this service permits them.',{},[],true],
+ ['list_displays','List connected displays with display_id and geometry for get_display_screenshot.',{},[],true],
  ['get_app_state','Select an allowed app and read its focused window accessibility tree. Returns fresh snapshot_id and integer element indices.',{app:text},['app'],true],
- ['get_screenshot','Capture the selected window as PNG. Coordinates are screenshot pixels. Requires a fresh get_app_state.',target,['app','snapshot_id'],true],
- ['click','AXPress an element_index, or left-click screenshot pixel x/y after get_screenshot. Coordinate clicks activate the app and move the system pointer. Returns fresh state.',{...target,element_index:{type:'integer',minimum:0},x:{type:'number',minimum:0},y:{type:'number',minimum:0}},['app','snapshot_id'],false],
+ ['get_screenshot','Capture the selected allowlisted app window as PNG. Requires get_app_state. Does not capture the full desktop.',target,['app','snapshot_id'],true],
+ ['get_display_screenshot','Capture a full display as PNG (Screen Recording required). Read-only; does not grant clicking outside the allowlist. Use list_displays for display_id.',{display_id:{type:'integer',minimum:0,description:'display_id from list_displays.'}},['display_id'],true],
+ ['click','AXPress an element_index, or left-click screenshot pixel x/y after get_screenshot on an allowlisted app window. Coordinate clicks activate the app and move the system pointer. Returns fresh state.',{...target,element_index:{type:'integer',minimum:0},x:{type:'number',minimum:0},y:{type:'number',minimum:0}},['app','snapshot_id'],false],
  ['set_value','Set the AX value of a settable element and return fresh state.',{...target,element_index:{type:'integer',minimum:0},value:{type:'string'}},['app','snapshot_id','element_index','value'],false],
  ['type_text','Type Unicode text into the selected app. Activates the app. Returns fresh state.',{...target,text:{type:'string',maxLength:16000}},['app','snapshot_id','text'],false],
  ['press_key','Send Return, Tab, Space, Escape, Backspace, Delete, arrows or a/c/v/x/z; optional super/cmd/shift/alt/ctrl modifiers joined with +. Activates app and returns fresh state.',{...target,key:text},['app','snapshot_id','key'],false],
@@ -33,7 +35,7 @@ server.setRequestHandler(CallToolRequestSchema,async(request,extra)=>{
   if(Object.keys(args).some(key=>!Object.hasOwn(tool.inputSchema.properties,key)))throw new Error('Unknown argument');
   for(const key of tool.inputSchema.required)if(!Object.hasOwn(args,key))throw new Error(`Missing argument: ${key}`);
   const result=await rpc(socketPath,'tools/call',{session_id:session,name:tool.name,arguments:args},{signal:extra.signal});
-  if(tool.name==='get_screenshot'&&!result.isError){const {data,mimeType,...metadata}=result;return {content:[{type:'text',text:JSON.stringify(metadata)},{type:'image',data,mimeType}]};}
+  if((tool.name==='get_screenshot'||tool.name==='get_display_screenshot')&&!result.isError){const {data,mimeType,...metadata}=result;return {content:[{type:'text',text:JSON.stringify(metadata)},{type:'image',data,mimeType}]};}
   return {content:[{type:'text',text:JSON.stringify(result)}],isError:!!result.isError};
  }catch(error){return {content:[{type:'text',text:error.message}],isError:true};}
 });

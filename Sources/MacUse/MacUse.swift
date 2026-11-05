@@ -49,73 +49,37 @@ func validateSocketDirectory(_ path: String) -> Bool {
     return st.st_uid == getuid() && st.st_mode & 0o077 == 0
 }
 
-/// macOS 15+ (Sequoia) warns when apps enumerate `SCShareableContent` without the system picker.
-/// Register capture targets once via `SCContentSharingPicker`, then reuse the returned filters.
-@MainActor
-final class CaptureSelection: NSObject, SCContentSharingPickerObserver {
-    private var filters: [String: SCContentFilter] = [:]
-    private var pending: CheckedContinuation<Void, Error>?
-    private var pendingApp: String?
-    let allowedApps: Set<String>
+func cgDisplayID(for screen: NSScreen) -> UInt32? {
+    (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+}
 
-    init(allowedApps: Set<String>) {
-        self.allowedApps = allowedApps
-        super.init()
-        let picker = SCContentSharingPicker.shared
-        picker.add(self)
-        picker.isActive = true
-        var config = SCContentSharingPickerConfiguration()
-        config.allowedPickerModes = [.singleWindow, .singleApplication]
-        config.allowsChangingSelectedContent = true
-        picker.defaultConfiguration = config
+func screen(for displayID: UInt32) -> NSScreen? {
+    NSScreen.screens.first { cgDisplayID(for: $0) == displayID }
+}
+
+func listDisplayInfo() -> [[String: Any]] {
+    NSScreen.screens.enumerated().compactMap { index, screen in
+        guard let id = cgDisplayID(for: screen) else { return nil }
+        let frame = screen.frame
+        return [
+            "display_id": Int(id),
+            "index": index,
+            "width_points": frame.width,
+            "height_points": frame.height,
+            "origin_x": frame.minX,
+            "origin_y": frame.minY,
+            "backing_scale": screen.backingScaleFactor,
+            "coordinates": "PNG pixels for get_display_screenshot are relative to this display's top-left; map to global space using origin_x/origin_y and width/height.",
+        ] as [String: Any]
     }
+}
 
-    func isRegistered(app: String) -> Bool { filters[app] != nil }
-    func registeredApps() -> [String] { allowedApps.filter { filters[$0] != nil }.sorted() }
-
-    func register(app: String) async throws {
-        guard allowedApps.contains(app) else { throw fail("app_not_allowed", "Bundle \(app) is not in the service allowlist.") }
-        if filters[app] != nil { return }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            pending = continuation
-            pendingApp = app
-            SCContentSharingPicker.shared.present(using: .window)
-        }
-    }
-
-    func ensureFilter(for app: String) async throws -> SCContentFilter {
-        if let filter = filters[app] { return filter }
-        try await register(app: app)
-        guard let filter = filters[app] else {
-            throw fail("capture_picker_required", "Choose \(app) in the system capture picker (see README).")
-        }
-        return filter
-    }
-
-    nonisolated func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
-        Task { @MainActor in
-            if let app = pendingApp { filters[app] = filter }
-            pending?.resume()
-            pending = nil
-            pendingApp = nil
-        }
-    }
-
-    nonisolated func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
-        Task { @MainActor in
-            pending?.resume(throwing: fail("capture_picker_cancelled", "Screen capture picker was cancelled; no filter was saved."))
-            pending = nil
-            pendingApp = nil
-        }
-    }
-
-    nonisolated func contentSharingPickerStartDidFailWithError(_ error: Error) {
-        Task { @MainActor in
-            pending?.resume(throwing: fail("capture_picker_failed", error.localizedDescription))
-            pending = nil
-            pendingApp = nil
-        }
-    }
+func pngResult(from image: CGImage, extra: [String: Any]) throws -> [String: Any] {
+    guard let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw fail("capture_failed", "PNG encoding failed.") }
+    guard data.count <= 16 * 1024 * 1024 else { throw fail("capture_too_large", "Encoded screenshot exceeds 16 MiB.") }
+    var result: [String: Any] = ["mimeType": "image/png", "data": data.base64EncodedString(), "width": image.width, "height": image.height]
+    for (key, value) in extra { result[key] = value }
+    return result
 }
 
 struct Snapshot {
@@ -134,32 +98,12 @@ struct Snapshot {
 @MainActor final class Engine {
     let allowedApps: Set<String>
     var snapshots: [String: Snapshot] = [:]
-    private let captureSelection: CaptureSelection?
-
-    init(allowedApps: Set<String>) {
-        self.allowedApps = allowedApps
-        if #available(macOS 15.0, *) {
-            self.captureSelection = CaptureSelection(allowedApps: allowedApps)
-        } else {
-            self.captureSelection = nil
-        }
-    }
+    init(allowedApps: Set<String>) { self.allowedApps = allowedApps }
 
     func permissions(prompt: Bool = false) -> [String: Any] {
         let trusted = prompt ? AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) : AXIsProcessTrusted()
-        let screen: Bool
-        if #available(macOS 15.0, *) {
-            // Broad CGRequestScreenCaptureAccess() triggers Sequoia's bypass warning; use the system picker instead.
-            screen = CGPreflightScreenCaptureAccess()
-        } else {
-            screen = prompt ? CGRequestScreenCaptureAccess() : CGPreflightScreenCaptureAccess()
-        }
-        var result: [String: Any] = ["accessibility": trusted, "screen_recording": screen]
-        if #available(macOS 15.0, *), let captureSelection, !allowedApps.isEmpty {
-            result["capture_registered_apps"] = captureSelection.registeredApps()
-            result["capture_picker_required_apps"] = allowedApps.filter { !captureSelection.isRegistered(app: $0) }.sorted()
-        }
-        return result
+        let screen = prompt ? CGRequestScreenCaptureAccess() : CGPreflightScreenCaptureAccess()
+        return ["accessibility": trusted, "screen_recording": screen]
     }
     func app(_ name: String) async throws -> NSRunningApplication {
         guard allowedApps.contains(name) else { throw fail("app_not_allowed", "Start the service with --allow-app \(name) to allow this bundle identifier.") }
@@ -222,27 +166,7 @@ struct Snapshot {
     }
     func screenshot(_ args: [String: Any], session: String) async throws -> [String: Any] {
         let selected = try snapshot(args, session: session)
-        if #available(macOS 15.0, *), let captureSelection {
-            return try await screenshotWithPicker(selected: selected, args: args, session: session, captureSelection: captureSelection)
-        }
         return try await screenshotWithShareableContent(selected: selected, args: args, session: session)
-    }
-
-    func screenshotWithPicker(selected: Snapshot, args: [String: Any], session: String, captureSelection: CaptureSelection) async throws -> [String: Any] {
-        let filter = try await captureSelection.ensureFilter(for: selected.app)
-        let scale = backingScale(for: selected.rect)
-        let config = SCStreamConfiguration()
-        config.width = Int((selected.rect.width * scale).rounded(.up))
-        config.height = Int((selected.rect.height * scale).rounded(.up))
-        guard config.width <= 8192, config.height <= 8192 else { throw fail("capture_too_large", "Window exceeds the 8192-pixel capture limit.") }
-        config.showsCursor = false
-        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        _ = try snapshot(args, session: session)
-        guard let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw fail("capture_failed", "PNG encoding failed.") }
-        guard data.count <= 16 * 1024 * 1024 else { throw fail("capture_too_large", "Encoded screenshot exceeds 16 MiB.") }
-        snapshots[session]?.screenshotSize = CGSize(width: image.width, height: image.height)
-        snapshots[session]?.captureFrame = selected.rect
-        return ["mimeType": "image/png", "data": data.base64EncodedString(), "width": image.width, "height": image.height, "snapshot_id": selected.id]
     }
 
     func screenshotWithShareableContent(selected: Snapshot, args: [String: Any], session: String) async throws -> [String: Any] {
@@ -261,11 +185,37 @@ struct Snapshot {
         let image = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: target), configuration: config)
         // Validate again after the asynchronous capture before retaining coordinate mapping.
         _ = try snapshot(args, session: session)
-        guard let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw fail("capture_failed", "PNG encoding failed.") }
-        guard data.count <= 16 * 1024 * 1024 else { throw fail("capture_too_large", "Encoded screenshot exceeds 16 MiB.") }
         snapshots[session]?.screenshotSize = CGSize(width: image.width, height: image.height)
         snapshots[session]?.captureFrame = target.frame
-        return ["mimeType": "image/png", "data": data.base64EncodedString(), "width": image.width, "height": image.height, "snapshot_id": selected.id]
+        return try pngResult(from: image, extra: ["snapshot_id": selected.id, "scope": "window"])
+    }
+
+    func displayScreenshot(_ args: [String: Any]) async throws -> [String: Any] {
+        guard let raw = args["display_id"] as? Int, raw >= 0 else { throw fail("invalid_arguments", "Required integer: display_id (from list_displays).") }
+        let displayID = UInt32(raw)
+        guard let screen = screen(for: displayID), let frame = Optional(screen.frame) else {
+            throw fail("display_not_found", "Unknown display_id; call list_displays.")
+        }
+        let scale = max(1, screen.backingScaleFactor)
+        let config = SCStreamConfiguration()
+        config.width = Int((frame.width * scale).rounded(.up))
+        config.height = Int((frame.height * scale).rounded(.up))
+        guard config.width <= 8192, config.height <= 8192 else { throw fail("capture_too_large", "Display exceeds the 8192-pixel capture limit.") }
+        config.showsCursor = false
+        guard CGPreflightScreenCaptureAccess() else { throw fail("permission_required", "Allow Screen Recording for this binary or its launching terminal, then retry.") }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) else { throw fail("display_not_found", "Display not available for capture.") }
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        return try pngResult(from: image, extra: [
+            "scope": "display",
+            "display_id": Int(displayID),
+            "origin_x": frame.minX,
+            "origin_y": frame.minY,
+            "width_points": frame.width,
+            "height_points": frame.height,
+            "coordinates": "PNG pixels are relative to this display image. Display capture does not authorize clicks; use get_app_state + get_screenshot for allowlisted app actions.",
+        ])
     }
     func focus(_ selected: Snapshot) async throws {
         guard let running = NSRunningApplication(processIdentifier: selected.pid) else { throw fail("target_exited", "App exited.") }
@@ -347,15 +297,10 @@ struct Snapshot {
         case "list_apps": return ["apps": NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }.map { ["app": $0.bundleIdentifier ?? "", "name": $0.localizedName ?? "", "pid": $0.processIdentifier, "allowed": allowedApps.contains($0.bundleIdentifier ?? "")] as [String: Any] }]
         case "get_app_state": return try await state(args, session: session)
         case "get_screenshot": return try await screenshot(args, session: session)
+        case "list_displays": return ["displays": listDisplayInfo()]
+        case "get_display_screenshot": return try await displayScreenshot(args)
         case "click", "set_value", "type_text", "press_key": return try await input(name, args, session: session)
         case "end_session": snapshots.removeValue(forKey: session); return ["ended": true]
-        case "register_capture":
-            if #available(macOS 15.0, *), let captureSelection {
-                let app = try required(args, "app")
-                try await captureSelection.register(app: app)
-                return ["registered": true, "app": app]
-            }
-            return ["registered": true, "note": "Not required before macOS 15."]
         default: throw fail("unknown_tool", "Unknown tool: \(name)")
         }
     }
@@ -404,6 +349,55 @@ func writeAll(_ fd: Int32, _ data: Data) -> Bool {
         return true
     }
 }
+
+/// Returns true when a MacUse service responds to ping on this socket path.
+func probeMacUseService(at path: String) -> Bool {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+    defer { Darwin.close(fd) }
+    var timeout = timeval(tv_sec: 2, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+    withUnsafeMutableBytes(of: &address.sun_path) { raw in
+        raw.initializeMemory(as: UInt8.self, repeating: 0)
+        path.utf8CString.withUnsafeBytes { bytes in raw.copyBytes(from: bytes) }
+    }
+    guard withUnsafePointer(to: &address, { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }) == 0 else { return false }
+    let id = "probe"
+    guard let body = try? JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": id, "method": "ping", "params": [:]] as [String: Any]) else { return false }
+    var size = UInt32(body.count).littleEndian
+    let frame = withUnsafeBytes(of: &size) { Data($0) } + body
+    guard writeAll(fd, frame), let header = readExactly(fd, 4) else { return false }
+    let length = header.enumerated().reduce(0) { $0 | (Int($1.element) << (8 * $1.offset)) }
+    guard length > 0, length <= 1024 * 1024, let payload = readExactly(fd, length),
+          let response = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+          response["id"] as? String == id,
+          let result = response["result"] as? [String: Any],
+          result["serverApiVersion"] as? String == "MacUse-1" else { return false }
+    return true
+}
+
+/// Remove an orphaned socket file; refuse when another MacUse instance is listening.
+func prepareSocketPath(_ path: String) {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return }
+    guard (st.st_mode & S_IFMT) == S_IFSOCK else {
+        fputs("Socket path exists and is not a Unix socket.\n", stderr)
+        exit(1)
+    }
+    if probeMacUseService(at: path) {
+        fputs("MacUse is already listening at \(path). Stop the running instance first.\n", stderr)
+        exit(1)
+    }
+    guard unlink(path) == 0 else { perror("unlink stale socket"); exit(1) }
+    fputs("Removed stale socket at \(path)\n", stderr)
+}
+
 func serveConnection(_ fd: Int32, engine: Engine) async {
     defer { Darwin.close(fd) }
     var noPipe: Int32 = 1
@@ -424,56 +418,6 @@ func serveConnection(_ fd: Int32, engine: Engine) async {
     }
 }
 
-func rpcTool(socket path: String, name: String, arguments: [String: Any], session: String = "macuse-setup") throws -> [String: Any] {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { throw fail("socket_failed", "Cannot open control socket.") }
-    defer { close(fd) }
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    withUnsafeMutableBytes(of: &address.sun_path) { raw in path.utf8CString.withUnsafeBytes { raw.copyBytes(from: $0) } }
-    guard withUnsafePointer(to: &address, { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }) == 0 else {
-        throw fail("socket_connect_failed", "Cannot connect to \(path). Is MacUse Helper running?")
-    }
-    let id = UUID().uuidString
-    let body = try JSONSerialization.data(withJSONObject: ["jsonrpc":"2.0", "id":id, "method":"tools/call", "params":["session_id":session, "name":name, "arguments":arguments]])
-    var size = UInt32(body.count).littleEndian
-    let frame = withUnsafeBytes(of: &size) { Data($0) } + body
-    try frame.withUnsafeBytes { raw in
-        var offset = 0
-        while offset < frame.count {
-            let n = Darwin.write(fd, raw.baseAddress!.advanced(by: offset), frame.count - offset)
-            guard n > 0 else { throw fail("socket_write_failed", "Control socket closed.") }
-            offset += n
-        }
-    }
-    var header = Data(count: 4)
-    try header.withUnsafeMutableBytes { raw in
-        var offset = 0
-        while offset < 4 {
-            let n = Darwin.read(fd, raw.baseAddress!.advanced(by: offset), 4 - offset)
-            guard n > 0 else { throw fail("socket_read_failed", "No response from service.") }
-            offset += n
-        }
-    }
-    let length = header.enumerated().reduce(0) { $0 | (Int($1.element) << (8 * $1.offset)) }
-    guard length > 0, length <= 24 * 1024 * 1024 else { throw fail("socket_read_failed", "Invalid response size.") }
-    var payload = Data(count: length)
-    try payload.withUnsafeMutableBytes { raw in
-        var offset = 0
-        while offset < length {
-            let n = Darwin.read(fd, raw.baseAddress!.advanced(by: offset), length - offset)
-            guard n > 0 else { throw fail("socket_read_failed", "Truncated response.") }
-            offset += n
-        }
-    }
-    guard let response = try JSONSerialization.jsonObject(with: payload) as? [String: Any],
-          response["id"] as? String == id,
-          let result = response["result"] as? [String: Any] else { throw fail("socket_read_failed", "Malformed RPC response.") }
-    if result["isError"] as? Bool == true { throw fail(result["code"] as? String ?? "native_error", result["message"] as? String ?? "register_capture failed") }
-    return result
-}
-
 @main struct MacUse {
     @MainActor static func main() {
         guard ProcessInfo.processInfo.machineArchitectureIsARM else { fputs("MacUse requires arm64.\n", stderr); exit(1) }
@@ -491,51 +435,15 @@ func rpcTool(socket path: String, name: String, arguments: [String: Any], sessio
             args = ["serve", "--socket", directory.appendingPathComponent("cu.sock").path, "--allow-app", "com.apple.calculator"]
         }
         if bundled && args == ["--request-permissions"] { args = ["permissions", "--prompt"] }
-        if bundled && args.first == "--select-capture" { args = ["select-capture"] + Array(args.dropFirst()) }
         if args.first == "permissions" {
             let result = Engine(allowedApps: []).permissions(prompt: args.contains("--prompt"))
             guard let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
                   let text = String(data: data, encoding: .utf8) else { fputs("Failed to encode permissions.\n", stderr); exit(1) }
             print(text)
-            if args.contains("--prompt"), #available(macOS 15.0, *) {
-                fputs("On macOS 15+, also run MacUse Helper with --select-capture once per allowlisted app for screenshots (avoids Sequoia bypass prompts).\n", stderr)
-            }
-            return
-        }
-        if args.first == "select-capture" {
-            guard #available(macOS 15.0, *) else {
-                print("{\"capture_picker\":\"not_required\",\"reason\":\"macOS 14 and earlier use Screen Recording permission only.\"}")
-                return
-            }
-            var allowed = Set<String>()
-            var socket = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacUse/cu.sock").path
-            var index = 1
-            while index < args.count {
-                if args[index] == "--allow-app" {
-                    guard index + 1 < args.count else { break }
-                    allowed.insert(args[index + 1]); index += 2; continue
-                }
-                if args[index] == "--socket" {
-                    guard index + 1 < args.count else { break }
-                    socket = args[index + 1]; index += 2; continue
-                }
-                fputs("Usage: select-capture [--socket PATH] --allow-app BUNDLE_ID [...]\n", stderr); exit(1)
-            }
-            if allowed.isEmpty { allowed.insert("com.apple.calculator") }
-            do {
-                for app in allowed.sorted() {
-                    let result = try rpcTool(socket: socket, name: "register_capture", arguments: ["app": app])
-                    print(String(data: try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), encoding: .utf8)!)
-                }
-            } catch let error as CUError {
-                fputs("\(error.message)\n", stderr); exit(1)
-            } catch {
-                fputs("\(error.localizedDescription)\n", stderr); exit(1)
-            }
             return
         }
         guard args.first == "serve" else {
-            print("MacUse (macOS arm64)\n  macuse serve --socket PATH --allow-app BUNDLE_ID [--allow-app BUNDLE_ID ...]\n  macuse permissions [--prompt]\n  macuse select-capture --allow-app BUNDLE_ID   (macOS 15+ screenshot setup)\nRun the MCP bridge separately; see README.md. Service stays in foreground until stopped.")
+            print("MacUse (macOS arm64)\n  macuse serve --socket PATH --allow-app BUNDLE_ID [--allow-app BUNDLE_ID ...]\n  macuse permissions [--prompt]\nRun the MCP bridge separately; see README.md. Service stays in foreground until stopped.")
             return
         }
         var path: String?, allowed = Set<String>()
@@ -549,8 +457,7 @@ func rpcTool(socket path: String, name: String, arguments: [String: Any], sessio
         // The caller creates the private directory. Refuse shared or foreign directories and existing paths.
         let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
         guard validateSocketDirectory(directory) else { fputs("Socket parent must be an existing owner-only directory (chmod 700), not a symlink.\n", stderr); exit(1) }
-        var st = stat()
-        guard lstat(path, &st) != 0, errno == ENOENT else { fputs("Socket path already exists. Stop its service before removing a stale socket.\n", stderr); exit(1) }
+        prepareSocketPath(path)
         umask(0o077)
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { perror("socket"); exit(1) }

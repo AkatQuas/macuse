@@ -22,9 +22,19 @@ try {
  const second=spawn(resolve('.build/debug/MacUse'),['serve','--socket',socket]);
  const status=await new Promise(r=>second.on('exit',r));assert.notEqual(status,0);
  assert.equal((await rpc(socket,'ping',{})).architecture,'arm64');
- console.log('PASS: framing, reconnects, permission contract, session isolation, unknown tool, malformed session, duplicate service');
+ // Orphan socket file (e.g. after SIGKILL): new instance should probe, unlink, and serve.
+ child.kill('SIGKILL');await new Promise(r=>child.once('exit',r));
+ assert.equal(existsSync(socket),true,'SIGKILL leaves the socket path');
+ const recovered=spawn(resolve('.build/debug/MacUse'),['serve','--socket',socket],{stdio:['ignore','pipe','pipe']});
+ let recoveredLog='';recovered.stderr.on('data',c=>recoveredLog+=c);
+ for(let i=0;i<100;i++){
+  if(recovered.exitCode!==null)throw new Error(recoveredLog);
+  try{assert.equal((await rpc(socket,'ping',{})).serverApiVersion,'MacUse-1');break;}
+  catch{await new Promise(r=>setTimeout(r,25));}
+ }
+ assert.match(recoveredLog,/Removed stale socket/);
+ recovered.kill('SIGTERM');await new Promise(r=>recovered.once('exit',r));
+ console.log('PASS: framing, reconnects, permission contract, session isolation, unknown tool, malformed session, duplicate service, stale socket recovery');
 }finally{
- child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));
- assert.equal(existsSync(socket),false,'service removes its socket on SIGTERM');
  rmSync(root,{recursive:true,force:true});
 }

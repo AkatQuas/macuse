@@ -32,7 +32,7 @@ Download **`MacUse-macos-arm64.zip`** from [GitHub Releases](https://github.com/
 open -g "/path/to/MacUse Helper.app"
 ```
 
-By default the app listens on `~/Library/Application Support/MacUse/cu.sock` and allowlists **Calculator** (`com.apple.calculator`). Grant **Accessibility** when prompted (or via System Settings).
+By default the app listens on `~/Library/Application Support/MacUse/cu.sock` and allowlists **Calculator** (`com.apple.calculator`). Grant **Accessibility** and **Screen Recording** when prompted (or via System Settings).
 
 Trigger permission prompts from a fresh process instance:
 
@@ -40,27 +40,11 @@ Trigger permission prompts from a fresh process instance:
 open -n -g "/path/to/MacUse Helper.app" --args --request-permissions
 ```
 
-**macOS 15 (Sequoia) and later — screenshots without the bypass warning**
+**macOS 15 (Sequoia)** may show recurring alerts when MacUse captures via ScreenCaptureKit without Apple’s system sharing picker. MacUse intentionally keeps the **rc1-style programmatic capture** (Screen Recording + allowlisted window matching) so agents are not blocked on per-app picker flows. Integrators who need picker-only capture on Sequoia can wrap or fork the service; that tradeoff is documented, not enforced here.
 
-Apple shows a recurring alert if an app uses ScreenCaptureKit’s programmatic window list (`SCShareableContent`) instead of the **system capture picker**. MacUse avoids that path on macOS 15+:
+**Stale socket after `kill -9`:** SIGTERM/SIGINT remove the socket on exit; SIGKILL does not. On startup, MacUse **probes** the path with a `ping` RPC—if a live service answers, startup fails; otherwise it **unlinks the orphaned socket** and binds.
 
-1. Grant **Accessibility** (as above).
-2. **While MacUse Helper is running**, register each allowlisted app with the system picker (choose the app’s window when macOS asks):
-
-```sh
-open -g "/path/to/MacUse Helper.app"   # if not already running
-open -n "/path/to/MacUse Helper.app" --args --select-capture --allow-app com.apple.calculator
-```
-
-The first `get_screenshot` for an app can also open the picker automatically; `--select-capture` is the explicit setup step integrators can script.
-
-Repeat for every bundle ID you pass to `--allow-app`. Registrations live in the running helper process only — after restarting the app, run `--select-capture` again (or trigger `get_screenshot` once per app).
-
-On **macOS 14**, enable **Screen Recording** for MacUse Helper in System Settings instead; the picker step is not required.
-
-`check_permissions` on macOS 15+ includes `capture_registered_apps` and `capture_picker_required_apps` so integrators can detect missing picker setup.
-
-Custom socket and allowlist (only when no instance is already running):
+Custom socket and allowlist (only when no live instance is already listening):
 
 ```sh
 open -g "/path/to/MacUse Helper.app" --args serve \
@@ -81,7 +65,7 @@ node server.mjs
 
 Register the bridge in your MCP client: command `node`, args absolute path to `bridge/server.mjs`, env **`MACUSE_SOCKET`**. Optional **`MACUSE_SESSION`** is a caller-chosen local session id (not authentication).
 
-**Tools:** `check_permissions`, `list_apps`, `get_app_state`, `get_screenshot`, `click`, `set_value`, `type_text`, `press_key`, `end_session`.
+**Tools:** `check_permissions`, `list_apps`, `list_displays`, `get_app_state`, `get_screenshot`, `get_display_screenshot`, `click`, `set_value`, `type_text`, `press_key`, `end_session`.
 
 Legacy env names `NATIVE_CU_*` are still accepted by the bridge for compatibility with earlier prototypes.
 
@@ -141,7 +125,7 @@ Responses include `app`, `pid`, `snapshot_id`, `state`, `truncated`. Mutating to
 4. On error, timeout, or cancel, **re-read state** before sending more input (in-flight OS events are not rolled back).
 5. **`end_session`** when finished; the service keeps running for other tasks.
 
-Coordinates in screenshots are PNG pixels mapped to the selected window. **Coordinate clicks** map through the ScreenCaptureKit window frame captured with the screenshot (not the AX rect alone). Actions activate the target app and may move the real cursor; there is no headless “invisible cursor” mode. Multi-display layouts and menu-bar offsets can still affect clicks — validate on your target setup.
+Optional **`get_display_screenshot`** (with **`list_displays`**) captures a full monitor for observation only; it does not replace allowlisted window snapshots for **`click`**. **Coordinate clicks** map through the ScreenCaptureKit window frame captured with the screenshot (not the AX rect alone). Actions activate the target app and may move the real cursor; there is no headless “invisible cursor” mode. Multi-display layouts and menu-bar offsets can still affect clicks — validate on your target setup.
 
 The Unix socket accepts up to **16 concurrent connections**; additional clients wait up to **5 seconds** for a slot, then the connection closes.
 
