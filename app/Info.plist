@@ -13,5 +13,5 @@
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAccessibilityUsageDescription</key><string>MacUse reads and operates the applications you explicitly allow.</string>
-<key>NSScreenCaptureUsageDescription</key><string>MacUse captures allowed application windows for agent observation.</string>
+<key>NSScreenCaptureUsageDescription</key><string>MacUse captures allowlisted application windows you choose in the system capture picker (macOS 15+) or via Screen Recording permission.</string>
 </dict></plist>

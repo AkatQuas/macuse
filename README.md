@@ -32,13 +32,33 @@ Download **`MacUse-macos-arm64.zip`** from [GitHub Releases](https://github.com/
 open -g "/path/to/MacUse Helper.app"
 ```
 
-By default the app listens on `~/Library/Application Support/MacUse/cu.sock` and allowlists **Calculator** (`com.apple.calculator`). Grant **Accessibility** and **Screen Recording** when prompted (or via System Settings).
+By default the app listens on `~/Library/Application Support/MacUse/cu.sock` and allowlists **Calculator** (`com.apple.calculator`). Grant **Accessibility** when prompted (or via System Settings).
 
 Trigger permission prompts from a fresh process instance:
 
 ```sh
 open -n -g "/path/to/MacUse Helper.app" --args --request-permissions
 ```
+
+**macOS 15 (Sequoia) and later — screenshots without the bypass warning**
+
+Apple shows a recurring alert if an app uses ScreenCaptureKit’s programmatic window list (`SCShareableContent`) instead of the **system capture picker**. MacUse avoids that path on macOS 15+:
+
+1. Grant **Accessibility** (as above).
+2. **While MacUse Helper is running**, register each allowlisted app with the system picker (choose the app’s window when macOS asks):
+
+```sh
+open -g "/path/to/MacUse Helper.app"   # if not already running
+open -n "/path/to/MacUse Helper.app" --args --select-capture --allow-app com.apple.calculator
+```
+
+The first `get_screenshot` for an app can also open the picker automatically; `--select-capture` is the explicit setup step integrators can script.
+
+Repeat for every bundle ID you pass to `--allow-app`. Registrations live in the running helper process only — after restarting the app, run `--select-capture` again (or trigger `get_screenshot` once per app).
+
+On **macOS 14**, enable **Screen Recording** for MacUse Helper in System Settings instead; the picker step is not required.
+
+`check_permissions` on macOS 15+ includes `capture_registered_apps` and `capture_picker_required_apps` so integrators can detect missing picker setup.
 
 Custom socket and allowlist (only when no instance is already running):
 
